@@ -1,0 +1,23 @@
+src/wakeshift.ts
+  s_6f80851a7d6aaf::t_de8e9096f622e4 27
+  s_6f80851a7d6aaf::t_0a23a8e8c62064 6-10,12-13,22,28-35,50,53,63-65,67-69,72-75,78-90,92-99,101-107,109-125,127-138,140-141,159
+src/tools.ts
+  s_6f80851a7d6aaf::t_de8e9096f622e4 1080-1082
+  s_6f80851a7d6aaf::t_a0a3ce44b285b9 9,1079,1091,1093,1095
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "15be50dd4dba7d671c498371daf6ceb6eecd4801",
+  "prompts": {},
+  "sessions": {
+    "s_6f80851a7d6aaf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c6ab6b6-ac12-433a-af32-8ec4b5654c8c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Eric Levine <eric@clawvisor.com>"
+    }
+  }
+}
