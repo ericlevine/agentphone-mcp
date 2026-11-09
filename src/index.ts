@@ -317,19 +317,15 @@ async function verifyTokenAgainstBackend(
 
 
 async function startHttp(): Promise<void> {
-  const { MCPServer, oauthProxy, getRequestContext } = await import("mcp-use/server");
+  const { MCPServer } = await import("mcp-use");
+  const { attachTools } = await import("@wakeshift/sdk/tools");
 
   // Preserve header presence: malformed credentials must never be treated as
   // an anonymous request and replaced with the server's credential. null means
-  // the request context is unavailable; only undefined means a missing header.
-  const authorizationHeader = (): string | undefined | null => {
-    try {
-      const c: any = getRequestContext();
-      if (typeof c?.req?.header !== "function") return null;
-      return c.req.header("authorization");
-    } catch {
-      return null;
-    }
+  // the request is unavailable; only undefined means a missing header.
+  const authorizationHeader = (req: Request | undefined): string | undefined | null => {
+    if (!req) return null;
+    return req.headers.get("authorization") ?? undefined;
   };
 
   // Only the tool-call boundary chooses credentials. The shared API client
@@ -347,6 +343,16 @@ async function startHttp(): Promise<void> {
   // secret. OAuth only needs a client_id to be enabled.
   const clientSecret = process.env.MCP_OAUTH_CLIENT_SECRET;
   const oauthEnabled = Boolean(clientId);
+  if (oauthEnabled) {
+    // mcp-use 2 replaced v1's oauthProxy: it now issues its own tokens and needs
+    // a secret, shared storage, a new upstream callback URL, and every user to
+    // sign in again. Not migrated on this branch: refuse to start rather than
+    // run without the sign-in a deployment configured.
+    throw new Error(
+      "OAuth (MCP_OAUTH_CLIENT_ID) is not yet migrated to mcp-use 2's oauthProxy; " +
+        "unset it to run with per-request bearer keys."
+    );
+  }
   if (clientSecret && !clientId) {
     console.error(
       "MCP_OAUTH_CLIENT_SECRET is set but MCP_OAUTH_CLIENT_ID is missing; OAuth is disabled."
@@ -393,28 +399,11 @@ async function startHttp(): Promise<void> {
     // on a browser GET to /mcp without a bearer token, while MCP protocol
     // traffic (POST) stays authenticated. Makes setup publicly discoverable.
     publicLandingPage: true,
-    ...(oauthEnabled
-      ? {
-          oauth: oauthProxy({
-            authEndpoint:
-              process.env.AGENTPHONE_OAUTH_AUTHORIZE || "https://agentphone.ai/oauth/authorize",
-            tokenEndpoint: `${BASE_URL}/oauth/token`,
-            issuer: process.env.AGENTPHONE_OAUTH_ISSUER || BASE_URL,
-            clientId: clientId!,
-            ...(clientSecret ? { clientSecret } : {}),
-            scopes: ["mcp"],
-            verifyToken: verifyTokenAgainstBackend,
-          }),
-        }
-      : {}),
   });
 
-  // mcp-use delegates tool validation to the SDK McpServer it wraps
-  // (exposed as `nativeServer` / `server`); swap in concise error messages.
-  installConciseValidation(
-    (server as unknown as { nativeServer?: unknown; server?: unknown }).nativeServer ??
-      (server as unknown as { server?: unknown }).server
-  );
+  // mcp-use 2 builds its MCP server privately for each request and never hands
+  // it out, so installConciseValidation (which patches that server) has nothing
+  // to patch: over HTTP, validation errors are mcp-use's own.
 
   // Reject an oversized request body before it is parsed, so a malformed payload
   // can't force the JSON parser / validator to allocate unbounded memory on the
@@ -575,6 +564,35 @@ async function startHttp(): Promise<void> {
   server.app.get("/.well-known/mcp.json", serveManifest);
   server.app.get("/mcp.json", serveManifest);
 
+  // Wakeshift: mcp-use 2 never exposes its MCP server, so `attach` can't be
+  // used. attachTools wraps each tool that subscribes and supplies Wakeshift's
+  // built-in tools; there are no native MCP Events (ChatGPT can't subscribe).
+  const wakeTools = attachTools(wake, {});
+  // A tool's callback doesn't get the call's _meta (where Codex and Claude Code
+  // name themselves and their thread); mcp-use's tools/call middleware does.
+  const callMeta = new AsyncLocalStorage<Record<string, unknown> | undefined>();
+  server.use("mcp:tools/call", ((ctx: any, next: () => Promise<unknown>) =>
+    callMeta.run(ctx.params?._meta, next)) as any);
+  const wakeContext = (ctx: any) => ({
+    clientInfo: ctx.client?.info?.(),
+    headers: Object.fromEntries(ctx.req?.raw?.headers ?? []),
+    signal: ctx.signal,
+    meta: callMeta.getStore(),
+    auth: ctx.auth,
+  });
+
+  // The credential a call acts with, or "" (fail closed).
+  const tokenFor = (header: string | undefined | null): string => {
+    const bearer = header?.match(/^Bearer +([^\s]+)$/i)?.[1] || "";
+    return bearer || (allowAnonymous && header === undefined ? serverApiKey : "");
+  };
+  const unauthorized = {
+    content: [
+      { type: "text", text: "Unauthorized: send `Authorization: Bearer <AgentPhone API key>` with each request." },
+    ],
+    isError: true,
+  };
+
   // Adapter: keep tools.ts's SDK-style registration (4- and 5-arg overloads)
   // and bind the per-request token.
   const registrar: ToolRegistrar = {
@@ -596,63 +614,72 @@ async function startHttp(): Promise<void> {
         typeof annotationsOrHandler === "function" ? {} : annotationsOrHandler
       ) as Record<string, unknown>;
       const { title, annotations } = resolveToolMeta(name, passed);
+      const outputSchema = outputSchemaFor(name);
+      const subscribes = (WAKESHIFT_WRAP as Record<string, any[]>)[name];
+
+      if (subscribes) {
+        // A tool that subscribes: Wakeshift adds its arguments to the input
+        // schema and a `wakeshift` field to the structured output.
+        const t = wakeTools.tool(
+          name,
+          { description, inputSchema: schema ?? {}, annotations, subscribes } as any,
+          async (args: any, ctx: any) => {
+            const token = tokenFor(ctx?.headers ? (ctx.headers.authorization ?? undefined) : null);
+            if (!token) return unauthorized as any;
+            return tokenStore.run(token, () => handler(args)) as any;
+          }
+        );
+        server.tool(
+          {
+            name,
+            title,
+            description: t.metadata.description,
+            inputSchema: z.object(t.schema as any),
+            annotations: annotations as Record<string, unknown>,
+            ...(outputSchema instanceof z.ZodObject
+              ? { outputSchema: outputSchema.extend({ wakeshift: z.string().optional() }) }
+              : outputSchema ? { outputSchema } : {}),
+          } as any,
+          (async (args: any, ctx: any) => t.handler(args, wakeContext(ctx) as any)) as any
+        );
+        return;
+      }
+
       server.tool(
         {
           name,
           title,
           description,
-          schema: z.object(schema ?? {}),
+          inputSchema: z.object(schema ?? {}),
           annotations: annotations as Record<string, unknown>,
-          ...(outputSchemaFor(name) ? { outputSchema: outputSchemaFor(name) } : {}),
-        },
-        async (params: unknown, ctx: any) => {
-          const header = authorizationHeader();
-          const bearer = header?.match(/^Bearer +([^\s]+)$/i)?.[1] || "";
-          const token: string = oauthEnabled
-            ? ctx?.auth?.accessToken || ""
-            : bearer || (allowAnonymous && header === undefined ? serverApiKey : "");
-          if (!token) {
-            // Fail closed. Never let an unauthenticated caller borrow the
-            // server's credential by accident.
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Unauthorized: send `Authorization: Bearer <AgentPhone API key>` with each request.",
-                },
-              ],
-              isError: true,
-            } as any;
-          }
+          ...(outputSchema ? { outputSchema } : {}),
+        } as any,
+        (async (params: unknown, ctx: any) => {
+          const token = tokenFor(authorizationHeader(ctx?.req?.raw));
+          // Fail closed. Never let an unauthenticated caller borrow the
+          // server's credential by accident.
+          if (!token) return unauthorized as any;
           return tokenStore.run(token, () => handler(params as any)) as any;
-        }
+        }) as any
       );
     },
   };
 
   registerTools(registrar, api);
-
-  // Wakeshift: mcp-use builds an MCP SDK McpServer for each session (and each
-  // stateless request); attach to each one it hands out.
-  const sessionServer = server.getServerForSession.bind(server);
-  server.getServerForSession = (sessionId?: string) => {
-    const mcp = sessionServer(sessionId);
-    wake.attach(mcp as any, { wrap: WAKESHIFT_WRAP });
-    return mcp;
-  };
-  // Protocol 2026-07-28 has no session. mcp-use answers a request without one
-  // statelessly, through its own /mcp handler and its own auth, when the
-  // request doesn't accept an event stream: this only rewrites that header.
-  server.app.use("/mcp", async (c: any, next: () => Promise<void>) => {
-    if (
-      c.req.method === "POST" &&
-      !c.req.header("mcp-session-id") &&
-      c.req.header("mcp-protocol-version") === "2026-07-28"
-    ) {
-      c.req.raw.headers.set("accept", "application/json");
+  // Wakeshift's own tools (list_subscriptions, unsubscribe_events, ...).
+  if (wake.enabled) {
+    for (const b of wakeTools.builtins()) {
+      server.tool(
+        {
+          name: b.metadata.name,
+          description: b.metadata.description,
+          inputSchema: z.object(b.schema as any),
+          annotations: b.metadata.annotations,
+        } as any,
+        (async (args: any, ctx: any) => b.handler(args, wakeContext(ctx) as any)) as any
+      );
     }
-    await next();
-  });
+  }
 
   await server.listen(PORT);
   console.error(`AgentPhone MCP server listening on port ${PORT} (oauth ${oauthEnabled ? "on" : "off"})`);
