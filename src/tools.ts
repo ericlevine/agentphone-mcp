@@ -1073,29 +1073,43 @@ export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
   );
 
   // Registered only with Wakeshift on: without it nothing would ever arrive.
+  // How many numbers one watch_messages call may watch.
+  const MAX_WATCHED_NUMBERS = 50;
   if (wake.enabled) {
     server.tool(
       "watch_messages",
-      "Watch one of your numbers for inbound messages (SMS, iMessage, or WhatsApp), identified " +
-        `by its number ID. The watch lasts until ${WATCH_TTL} pass with no new message; calling it ` +
-        "again for the same number extends it. Returns once the watch is set up; read messages " +
-        "with get_messages.",
+      "Watch one or more of your numbers for inbound messages (SMS, iMessage, or WhatsApp), " +
+        "identified by their number IDs. To watch several numbers, pass them all in one call " +
+        `rather than calling once per number. A watch lasts until ${WATCH_TTL} pass with no new ` +
+        "message on that number; calling again for the same number extends it. Returns once the " +
+        "watches are set up; read messages with get_messages.",
       {
-        number_id: z.string().describe("The ID of the number to watch, from list_numbers."),
+        number_ids: z
+          .array(z.string())
+          .min(1)
+          .max(MAX_WATCHED_NUMBERS)
+          .describe("The IDs of the numbers to watch, from list_numbers: one or several."),
       },
       { readOnlyHint: true, idempotentHint: true },
-      async ({ number_id }) => {
+      async ({ number_ids }) => {
+        const ids = [...new Set(number_ids as string[])];
         try {
-          // Confirms the caller can see this number before subscribing to it.
-          const number = await api.getNumber(number_id);
-          const sub = await watchNumber(number_id, api.boundToCurrentCredential());
-          if (sub.state === "unavailable") {
-            return err(new Error(`This client can't be notified of new messages (${sub.reason}). Use get_messages to check for new messages.`));
+          // Confirms the caller can see every number before subscribing to any.
+          const numbers = await Promise.all(ids.map((id) => api.getNumber(id)));
+          const bound = api.boundToCurrentCredential();
+          // One call, so every subscription belongs to the same conversation.
+          for (const id of ids) {
+            const sub = await watchNumber(id, bound);
+            if (sub.state === "unavailable") {
+              return err(new Error(`This client can't be notified of new messages (${sub.reason}). Use get_messages to check for new messages.`));
+            }
           }
-          return ok(`Watching ${number.phoneNumber} (id=${number_id}) for inbound messages.`, {
-            number_id,
-            phone_number: number.phoneNumber,
-          });
+          const watching = ids.map((id, i) => ({ number_id: id, phone_number: numbers[i].phoneNumber }));
+          return ok(
+            `Watching ${watching.length} number(s) for inbound messages:\n` +
+              watching.map((w) => `  ${w.phone_number} (id=${w.number_id})`).join("\n"),
+            { watching }
+          );
         } catch (e) {
           return err(e);
         }

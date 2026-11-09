@@ -181,8 +181,14 @@ export const WAKESHIFT_WRAP = {
 export const WAKESHIFT_OUTPUT_SCHEMAS: Record<string, z.ZodTypeAny> = {
   watch_messages: z
     .object({
-      number_id: z.string().describe("The number being watched."),
-      phone_number: z.string().describe("Its phone number, in E.164 form."),
+      watching: z
+        .array(
+          z.object({
+            number_id: z.string().describe("A number being watched."),
+            phone_number: z.string().describe("Its phone number, in E.164 form."),
+          })
+        )
+        .describe("Every number this call is watching."),
     })
-    .describe("The number now being watched for inbound messages."),
+    .describe("The numbers now being watched for inbound messages."),
 };
