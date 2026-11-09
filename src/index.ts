@@ -23,7 +23,19 @@ import { z } from "zod";
 import { AgentPhoneAPI } from "./api.js";
 import { registerTools, type ToolRegistrar } from "./tools.js";
 import { OUTPUT_SCHEMAS } from "./output-schemas.js";
-import { wake, WAKESHIFT_WRAP, WAKESHIFT_OUTPUT_SCHEMAS } from "./wakeshift.js";
+import {
+  wake,
+  WAKESHIFT_WRAP,
+  WAKESHIFT_OUTPUT_SCHEMAS,
+  emitMessageReceived,
+  usePushDelivery,
+} from "./wakeshift.js";
+import {
+  MESSAGE_RECEIVED_PATH,
+  MAX_EVENT_BODY_BYTES,
+  handleMessageReceived,
+  signingKey,
+} from "./backend-events.js";
 
 const outputSchemaFor = (name: string) => OUTPUT_SCHEMAS[name] ?? WAKESHIFT_OUTPUT_SCHEMAS[name];
 
@@ -527,6 +539,39 @@ async function startHttp(): Promise<void> {
     }
     return c.json(buildManifest(origin));
   };
+  // The AgentPhone backend reports each inbound message here, signed with
+  // AGENTPHONE_EVENTS_SECRET, and this server emits message.received: no
+  // polling. Mounted only with both the secret and WAKESHIFT_KEY set; until
+  // then the route doesn't exist. See docs/backend-events.md.
+  const eventsSecret = process.env.AGENTPHONE_EVENTS_SECRET?.trim();
+  if (eventsSecret && !wake.enabled) {
+    console.error("AGENTPHONE_EVENTS_SECRET is set but WAKESHIFT_KEY is not; the backend events route is off.");
+  } else if (eventsSecret) {
+    const key = signingKey(eventsSecret); // throws at startup on a malformed secret
+    server.app.post(
+      MESSAGE_RECEIVED_PATH,
+      bodyLimit({
+        maxSize: MAX_EVENT_BODY_BYTES,
+        onError: (c: any) => c.json({ error: "body_too_large" }, 413),
+      }),
+      async (c: any) => {
+        const result = await handleMessageReceived(
+          key,
+          {
+            id: c.req.header("webhook-id"),
+            timestamp: c.req.header("webhook-timestamp"),
+            signature: c.req.header("webhook-signature"),
+          },
+          await c.req.text(),
+          emitMessageReceived
+        );
+        return result.body ? c.json(result.body, result.status) : c.body(null, result.status);
+      }
+    );
+    usePushDelivery();
+    console.error(`Backend events on: POST ${MESSAGE_RECEIVED_PATH}; watch_messages won't poll.`);
+  }
+
   server.app.get("/.well-known/mcp.json", serveManifest);
   server.app.get("/mcp.json", serveManifest);
 

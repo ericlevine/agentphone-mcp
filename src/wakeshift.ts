@@ -5,9 +5,12 @@
  * message.received — a message arrived on one of the account's numbers.
  * Subscribed by watch_messages, which keeps the conversation subscribed (one
  * wake per message) until the subscription expires or is ended. AgentPhone has
- * no webhook this server can receive, so a poller reads the number's messages
- * with the subscriber's own credential and emits each new inbound one. It stops
- * once no conversation is subscribed to the number.
+ * no webhook this server can receive, so by default a poller reads the
+ * number's messages with the subscriber's own credential and emits each new
+ * inbound one, stopping once no conversation is subscribed to the number. When
+ * the AgentPhone backend pushes messages instead (POST
+ * /internal/events/message-received, see docs/backend-events.md), the HTTP
+ * server turns polling off and emits from that route.
  *
  * Without WAKESHIFT_KEY the client is disabled: nothing is sent, no poller
  * runs, and every tool behaves as it did before.
@@ -75,11 +78,36 @@ export async function watchNumber(numberId: string, api: AgentPhoneAPI) {
   return sub;
 }
 
+export type MessageReceived = {
+  number_id: string;
+  message_id: string;
+  from: string | null;
+  received_at: string;
+};
+
+/**
+ * Emits one message.received. The id comes from the message, so a retry, or
+ * the same message reported by both the poller and the backend, wakes once.
+ */
+export function emitMessageReceived(m: MessageReceived) {
+  return messageReceived.emit(numberArg(m.number_id), m, {
+    id: `msg-${m.number_id}-${m.message_id}`.slice(0, 200),
+  });
+}
+
+// True once the backend pushes messages to this server: then nothing polls.
+let pushDelivery = false;
+
+/** Turns polling off: the AgentPhone backend reports every inbound message. */
+export function usePushDelivery(): void {
+  pushDelivery = true;
+}
+
 // One poller per number. A poller keeps the credential it started with.
 const pollers = new Map<string, { stop(): void }>();
 
 function startPoller({ numberId, api }: MessageWatchContext): void {
-  if (!wake.enabled || pollers.has(numberId)) return;
+  if (!wake.enabled || pushDelivery || pollers.has(numberId)) return;
 
   const args = numberArg(numberId);
   let stopped = false;
@@ -112,12 +140,12 @@ function startPoller({ numberId, api }: MessageWatchContext): void {
         // Newest first: emit the new inbound ones oldest first.
         const fresh = page.data.filter((m) => !seen!.has(m.id) && m.from !== ownNumber).reverse();
         for (const m of fresh) {
-          await messageReceived.emit(
-            args,
-            { number_id: numberId, message_id: m.id, from: m.from ?? null, received_at: m.receivedAt },
-            // One occurrence per message, however many times a retry sends it.
-            { id: `msg-${numberId}-${m.id}`.slice(0, 200) }
-          );
+          await emitMessageReceived({
+            number_id: numberId,
+            message_id: m.id,
+            from: m.from ?? null,
+            received_at: m.receivedAt,
+          });
         }
       }
       seen = new Set(page.data.map((m) => m.id));
