@@ -4,14 +4,10 @@ The MCP server's `watch_messages` tool lets an agent ask to be woken whenever a
 message arrives on one of its numbers. It wakes agents through
 [Wakeshift](https://wakeshift.ai), by emitting a `message.received` event.
 
-By default, the server finds new messages by polling the AgentPhone API every
-15 seconds for each watched number. Polling is slow (up to 15 seconds late),
-costs one API call per watched number every 15 seconds, and stops when the
-server restarts.
-
-Instead, the AgentPhone backend can report each inbound message to the MCP
-server as it arrives. The server then emits the event at once and polls
-nothing.
+The server has no other way to learn that a message arrived: it doesn't poll.
+The AgentPhone backend reports each inbound message to the MCP server as it
+arrives, and the server emits the event at once. Until the backend does,
+leave this off: `watch_messages` is offered only when it's configured.
 
 ## What the backend does
 
@@ -157,8 +153,7 @@ def notify_message_received(number_id: str, message_id: str, sender: str | None,
 
 Retrying is always safe. The event's ID comes from `number_id` and
 `message_id`, so Wakeshift delivers a message once, however many times it's
-reported, for a day after the first report. That also holds if the server's
-own poller reports the same message.
+reported, for a day after the first report.
 
 Send the notification off the request path that stores the message (a queue
 or a background job), so a slow or failed notification never delays or fails
@@ -168,8 +163,12 @@ receiving the message.
 
 | Variable | Value |
 | --- | --- |
-| `WAKESHIFT_KEY` | The Wakeshift app key. Without it the route is off. |
-| `AGENTPHONE_EVENTS_SECRET` | The shared signing secret, `whsec_…`. Setting it turns the route on and turns polling off. |
+| `WAKESHIFT_KEY` | The Wakeshift app key. |
+| `AGENTPHONE_EVENTS_SECRET` | The shared signing secret, `whsec_…`. |
+
+With both set, the server mounts the route and offers `watch_messages`. With
+either missing, Wakeshift is off: no route (`404`), no `watch_messages`, and
+nothing is sent to Wakeshift.
 
 Generate a secret with, for example:
 
@@ -180,12 +179,11 @@ node -e "console.log('whsec_' + require('crypto').randomBytes(32).toString('base
 Give the same value to the backend. A malformed secret stops the server at
 startup with an error, rather than refusing every request.
 
-The route exists only on the HTTP transport. A stdio server (`npx
+Wakeshift runs only on the HTTP transport. A stdio server (`npx
 agentphone-mcp` on someone's machine) can't be reached by the backend, so it
-keeps polling.
+never offers `watch_messages`.
 
-When `AGENTPHONE_EVENTS_SECRET` is set, `watch_messages` never polls, so a
-message the backend doesn't report wakes nobody. Turn it on only once the
+A message the backend doesn't report wakes nobody. Turn it on only once the
 backend sends every inbound message.
 
 ### Exposure

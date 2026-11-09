@@ -28,7 +28,6 @@ import {
   WAKESHIFT_WRAP,
   WAKESHIFT_OUTPUT_SCHEMAS,
   emitMessageReceived,
-  usePushDelivery,
 } from "./wakeshift.js";
 import {
   MESSAGE_RECEIVED_PATH,
@@ -270,9 +269,9 @@ async function startStdio(): Promise<void> {
       (server as any).registerTool(name, config, handler);
     },
   };
+  // No Wakeshift over stdio: its wakes come from the AgentPhone backend, which
+  // can't reach a process on the user's machine.
   registerTools(stdioRegistrar, api);
-  // After the tools are registered: Wakeshift amends the listed tools that subscribe.
-  wake.attach(server as any, { wrap: WAKESHIFT_WRAP });
   await server.connect(new StdioServerTransport());
 }
 
@@ -528,15 +527,19 @@ async function startHttp(): Promise<void> {
     }
     return c.json(buildManifest(origin));
   };
-  // The AgentPhone backend reports each inbound message here, signed with
-  // AGENTPHONE_EVENTS_SECRET, and this server emits message.received: no
-  // polling. Mounted only with both the secret and WAKESHIFT_KEY set; until
-  // then the route doesn't exist. See docs/backend-events.md.
+  // Wakeshift: the AgentPhone backend reports each inbound message here, signed
+  // with AGENTPHONE_EVENTS_SECRET, and this server emits message.received.
+  // Everything Wakeshift does (this route, watch_messages, attach) is on only
+  // with both the secret and WAKESHIFT_KEY set. See docs/backend-events.md.
   const eventsSecret = process.env.AGENTPHONE_EVENTS_SECRET?.trim();
+  const wakeshiftOn = Boolean(eventsSecret) && wake.enabled;
   if (eventsSecret && !wake.enabled) {
-    console.error("AGENTPHONE_EVENTS_SECRET is set but WAKESHIFT_KEY is not; the backend events route is off.");
-  } else if (eventsSecret) {
-    const key = signingKey(eventsSecret); // throws at startup on a malformed secret
+    console.error("AGENTPHONE_EVENTS_SECRET is set but WAKESHIFT_KEY is not; Wakeshift is off.");
+  } else if (wake.enabled && !eventsSecret) {
+    console.error("WAKESHIFT_KEY is set but AGENTPHONE_EVENTS_SECRET is not; Wakeshift is off (watch_messages needs backend events).");
+  }
+  if (wakeshiftOn) {
+    const key = signingKey(eventsSecret!); // throws at startup on a malformed secret
     server.app.post(
       MESSAGE_RECEIVED_PATH,
       bodyLimit({
@@ -557,8 +560,7 @@ async function startHttp(): Promise<void> {
         return result.body ? c.json(result.body, result.status) : c.body(null, result.status);
       }
     );
-    usePushDelivery();
-    console.error(`Backend events on: POST ${MESSAGE_RECEIVED_PATH}; watch_messages won't poll.`);
+    console.error(`Wakeshift on: backend events at POST ${MESSAGE_RECEIVED_PATH}; watch_messages offered.`);
   }
 
   server.app.get("/.well-known/mcp.json", serveManifest);
@@ -665,9 +667,9 @@ async function startHttp(): Promise<void> {
     },
   };
 
-  registerTools(registrar, api);
+  registerTools(registrar, api, { watchMessages: wakeshiftOn });
   // Wakeshift's own tools (list_subscriptions, unsubscribe_events, ...).
-  if (wake.enabled) {
+  if (wakeshiftOn) {
     for (const b of wakeTools.builtins()) {
       server.tool(
         {

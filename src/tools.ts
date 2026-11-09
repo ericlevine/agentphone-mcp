@@ -6,7 +6,7 @@
 
 import { z } from "zod";
 import { AgentPhoneAPI, ApiError } from "./api.js";
-import { wake, watchNumber, WATCH_TTL } from "./wakeshift.js";
+import { watchNumber, WATCH_TTL } from "./wakeshift.js";
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -344,7 +344,15 @@ function buildCallControls(args: {
   };
 }
 
-export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
+/**
+ * watchMessages: offer watch_messages. Only when Wakeshift is on and the
+ * AgentPhone backend pushes inbound messages (HTTP transport); see index.ts.
+ */
+export function registerTools(
+  server: ToolRegistrar,
+  api: AgentPhoneAPI,
+  opts: { watchMessages?: boolean } = {}
+): void {
   // ============================================================
   // Account Overview
   // ============================================================
@@ -1072,10 +1080,11 @@ export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
     }
   );
 
-  // Registered only with Wakeshift on: without it nothing would ever arrive.
+  // Registered only when Wakeshift is on and the backend pushes messages:
+  // otherwise nothing would ever arrive.
   // How many numbers one watch_messages call may watch.
   const MAX_WATCHED_NUMBERS = 50;
-  if (wake.enabled) {
+  if (opts.watchMessages) {
     server.tool(
       "watch_messages",
       "Watch one or more of your numbers for inbound messages (SMS, iMessage, or WhatsApp), " +
@@ -1096,10 +1105,9 @@ export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
         try {
           // Confirms the caller can see every number before subscribing to any.
           const numbers = await Promise.all(ids.map((id) => api.getNumber(id)));
-          const bound = api.boundToCurrentCredential();
           // One call, so every subscription belongs to the same conversation.
           for (const id of ids) {
-            const sub = await watchNumber(id, bound);
+            const sub = await watchNumber(id);
             if (sub.state === "unavailable") {
               return err(new Error(`This client can't be notified of new messages (${sub.reason}). Use get_messages to check for new messages.`));
             }
