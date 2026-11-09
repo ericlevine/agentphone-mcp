@@ -56,6 +56,16 @@ export class AgentPhoneAPI {
     this.apiKey = apiKey;
   }
 
+  /**
+   * A client bound to the credential in effect right now, for work that
+   * outlives the request (a background watch). The HTTP transport resolves the
+   * key per request, so a watch that ran later would otherwise find none.
+   */
+  boundToCurrentCredential(): AgentPhoneAPI {
+    const token = typeof this.apiKey === "function" ? this.apiKey() : this.apiKey;
+    return new AgentPhoneAPI(this.baseUrl, token);
+  }
+
   private async request<T>(
     method: string,
     path: string,

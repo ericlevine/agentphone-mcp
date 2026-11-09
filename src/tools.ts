@@ -6,6 +6,7 @@
 
 import { z } from "zod";
 import { AgentPhoneAPI, ApiError } from "./api.js";
+import { wake, subscribeToNextMessage } from "./wakeshift.js";
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -341,6 +342,12 @@ function buildCallControls(args: {
     callScreeningIdentity: args.call_screening_identity,
     callScreeningPurpose: args.call_screening_purpose,
   };
+}
+
+// The ID of the account's number with this E.164 phone number, or undefined.
+async function findNumberId(api: AgentPhoneAPI, phoneNumber: string): Promise<string | undefined> {
+  const page = await api.listNumbers(100, 0);
+  return page.data.find((n) => n.phoneNumber === phoneNumber)?.id;
 }
 
 export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
@@ -881,6 +888,16 @@ export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
         if (result.reply_parent_unresolved) {
           lines.push(`  Note: couldn't thread under the reply parent; delivered without threading.`);
         }
+        // The message is sent and paid for: subscribing to the reply is a
+        // convenience, so a failure here never fails the send.
+        if (wake.enabled) {
+          try {
+            const sender = number_id ?? (await findNumberId(api, result.from_number));
+            if (sender) await subscribeToNextMessage(sender, api.boundToCurrentCredential());
+          } catch (e) {
+            console.error("send_message: couldn't subscribe to the reply:", e instanceof Error ? e.name : typeof e);
+          }
+        }
         return ok(lines.join("\n"), result);
       } catch (e) {
         return err(e);
@@ -1070,6 +1087,36 @@ export function registerTools(server: ToolRegistrar, api: AgentPhoneAPI): void {
       return ok(lines.join("\n"), structured);
     }
   );
+
+  // Registered only with Wakeshift on: without it nothing would ever arrive.
+  if (wake.enabled) {
+    server.tool(
+      "watch_messages",
+      "Watch one of your numbers for the next inbound message (SMS, iMessage, or WhatsApp), " +
+        "identified by its number ID. Returns once the watch is set up; read the message with " +
+        "get_messages when it arrives.",
+      {
+        number_id: z.string().describe("The ID of the number to watch, from list_numbers."),
+      },
+      { readOnlyHint: true, idempotentHint: true },
+      async ({ number_id }) => {
+        try {
+          // Confirms the caller can see this number before subscribing to it.
+          const number = await api.getNumber(number_id);
+          const sub = await subscribeToNextMessage(number_id, api.boundToCurrentCredential());
+          if (sub.state === "unavailable") {
+            return err(new Error(`This client can't be notified of new messages (${sub.reason}). Use get_messages to check for replies.`));
+          }
+          return ok(`Watching ${number.phoneNumber} (id=${number_id}) for the next inbound message.`, {
+            number_id,
+            phone_number: number.phoneNumber,
+          });
+        } catch (e) {
+          return err(e);
+        }
+      }
+    );
+  }
 
   server.tool(
     "get_messages",

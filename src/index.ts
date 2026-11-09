@@ -23,6 +23,9 @@ import { z } from "zod";
 import { AgentPhoneAPI } from "./api.js";
 import { registerTools, type ToolRegistrar } from "./tools.js";
 import { OUTPUT_SCHEMAS } from "./output-schemas.js";
+import { wake, WAKESHIFT_WRAP, WAKESHIFT_OUTPUT_SCHEMAS } from "./wakeshift.js";
+
+const outputSchemaFor = (name: string) => OUTPUT_SCHEMAS[name] ?? WAKESHIFT_OUTPUT_SCHEMAS[name];
 
 const NAME = "agentphone";
 // Single source of truth for the version: read it from package.json so the
@@ -149,6 +152,7 @@ const TOOL_META: Record<string, ToolMeta> = {
   buy_number: { title: "Buy Phone Number", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   send_message: { title: "Send Message", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   get_messages: { title: "Get Messages", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  watch_messages: { title: "Watch for Messages", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   list_calls: { title: "List Calls", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   get_call: { title: "Get Call", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   end_call: { title: "End Call", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -249,11 +253,14 @@ async function startStdio(): Promise<void> {
         annotations,
       };
       if (title) config.title = title;
-      if (OUTPUT_SCHEMAS[name]) config.outputSchema = OUTPUT_SCHEMAS[name];
+      const outputSchema = outputSchemaFor(name);
+      if (outputSchema) config.outputSchema = outputSchema;
       (server as any).registerTool(name, config, handler);
     },
   };
   registerTools(stdioRegistrar, api);
+  // After the tools are registered: Wakeshift amends the listed tools that subscribe.
+  wake.attach(server as any, { wrap: WAKESHIFT_WRAP });
   await server.connect(new StdioServerTransport());
 }
 
@@ -551,7 +558,7 @@ async function startHttp(): Promise<void> {
           description,
           schema: z.object(schema ?? {}),
           annotations: annotations as Record<string, unknown>,
-          ...(OUTPUT_SCHEMAS[name] ? { outputSchema: OUTPUT_SCHEMAS[name] } : {}),
+          ...(outputSchemaFor(name) ? { outputSchema: outputSchemaFor(name) } : {}),
         },
         async (params: unknown, ctx: any) => {
           const header = authorizationHeader();
@@ -579,6 +586,29 @@ async function startHttp(): Promise<void> {
   };
 
   registerTools(registrar, api);
+
+  // Wakeshift: mcp-use builds an MCP SDK McpServer for each session (and each
+  // stateless request); attach to each one it hands out.
+  const sessionServer = server.getServerForSession.bind(server);
+  server.getServerForSession = (sessionId?: string) => {
+    const mcp = sessionServer(sessionId);
+    wake.attach(mcp as any, { wrap: WAKESHIFT_WRAP });
+    return mcp;
+  };
+  // Protocol 2026-07-28 has no session. mcp-use answers a request without one
+  // statelessly, through its own /mcp handler and its own auth, when the
+  // request doesn't accept an event stream: this only rewrites that header.
+  server.app.use("/mcp", async (c: any, next: () => Promise<void>) => {
+    if (
+      c.req.method === "POST" &&
+      !c.req.header("mcp-session-id") &&
+      c.req.header("mcp-protocol-version") === "2026-07-28"
+    ) {
+      c.req.raw.headers.set("accept", "application/json");
+    }
+    await next();
+  });
+
   await server.listen(PORT);
   console.error(`AgentPhone MCP server listening on port ${PORT} (oauth ${oauthEnabled ? "on" : "off"})`);
 }
